@@ -11,34 +11,46 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Load environment variables from .env file
 load_dotenv()
 
-def initialize_clients(api_provider):
-    """Initialize separate clients for generator, reflector, and curator"""
-    if api_provider == "sambanova":
-        # Use SambaNova API
-        base_url = "https://api.sambanova.ai/v1"
-        api_key = os.getenv('SAMBANOVA_API_KEY', '')
-        if not api_key:
-            raise ValueError("SambaNova api key not found in environment variables")
-    elif api_provider == "together":
-        # Use Together API
-        base_url = "https://api.together.xyz/v1"
-        api_key = os.getenv('TOGETHER_API_KEY', '')
-        if not api_key:
-            raise ValueError("Together api key not found in environment variables")
-    elif api_provider == "openai":
-        # Use OpenAI API
-        base_url = "https://api.openai.com/v1"
-        api_key = os.getenv('OPENAI_API_KEY', '')
-        if not api_key:
-            raise ValueError("OpenAI api key not found in environment variables")
-    else:
-        raise ValueError((f"Invalid api_provider name: {api_provider}. Must be 'sambanova', 'together', or 'openai'"))
-        
-    generator_client = openai.OpenAI(api_key=api_key, base_url=base_url)
-    reflector_client = openai.OpenAI(api_key=api_key, base_url=base_url)
-    curator_client = openai.OpenAI(api_key=api_key, base_url=base_url)
-    
-    print("Using Together API for all models")
+def initialize_clients(
+    api_provider: str = "openai",
+    generator_base_url: str = None,
+    generator_api_key: str = None,
+    reflector_base_url: str = None,
+    reflector_api_key: str = None,
+    curator_base_url: str = None,
+    curator_api_key: str = None,
+):
+    """Initialize separate clients for generator, reflector, and curator.
+
+    If per-actor base_url/api_key are provided, they override the api_provider defaults.
+    """
+    provider_urls = {
+        "sambanova": "https://api.sambanova.ai/v1",
+        "together": "https://api.together.xyz/v1",
+        "openai": "https://api.openai.com/v1",
+    }
+    provider_keys = {
+        "sambanova": os.getenv('SAMBANOVA_API_KEY', ''),
+        "together": os.getenv('TOGETHER_API_KEY', ''),
+        "openai": os.getenv('OPENAI_API_KEY', ''),
+    }
+    default_url = provider_urls[api_provider]
+    default_key = provider_keys[api_provider]
+
+    gen_url = generator_base_url or default_url
+    gen_key = generator_api_key or default_key
+    ref_url = reflector_base_url or default_url
+    ref_key = reflector_api_key or default_key
+    cur_url = curator_base_url or default_url
+    cur_key = curator_api_key or default_key
+
+    generator_client = openai.OpenAI(api_key=gen_key, base_url=gen_url)
+    reflector_client = openai.OpenAI(api_key=ref_key, base_url=ref_url)
+    curator_client = openai.OpenAI(api_key=cur_key, base_url=cur_url)
+
+    print(f"Generator client: {gen_url}")
+    print(f"Reflector client: {ref_url}")
+    print(f"Curator client: {cur_url}")
     return generator_client, reflector_client, curator_client
 
 def get_section_slug(section_name):
@@ -89,63 +101,101 @@ def extract_boxed_content(text):
         i += 1
     return None
 
+
+def _normalize_extracted_answer(answer: Any) -> str:
+    """Normalize extracted answer text for stable downstream scoring."""
+    text = str(answer).strip()
+    if len(text) >= 2 and (
+        (text[0] == '"' and text[-1] == '"')
+        or (text[0] == "'" and text[-1] == "'")
+    ):
+        text = text[1:-1].strip()
+    return text
+
+
 def extract_answer(response):
-    """Extract final answer from model response"""
+    """Extract final_answer from model response with strict-first JSON parsing."""
+    if response is None:
+        return "No final answer found"
+    if not isinstance(response, str):
+        response = str(response)
+
     try:
-        # First try JSON parsing
+        # 1) Strict JSON parse of the full response.
         parsed = json.loads(response)
-        answer = str(parsed.get("final_answer", "No final answer found"))
-        return answer  
-            
-    except (json.JSONDecodeError, KeyError, AttributeError):
-        # JSON parsing failed, use fallback logic
-        matches = re.findall(r"Finish\[(.*?)\]", response)
-        if matches:
-            answer = matches[-1]
-            return answer
-        
-        # Try to get final answer from JSON style response with regex matching 
-        # Try double quotes first
-        matches = re.findall(r'"final_answer"\s*:\s*"([^"]*)"', response)
-        if matches:
-            answer = matches[-1]
-            return answer
-        
-        # Try single quotes
-        matches = re.findall(r"'final_answer'\s*:\s*'([^']*)'", response)
-        if matches:
-            answer = matches[-1]
-            return answer
-        
-        # Handle JSON format without quotes (for simple expressions)
-        matches = re.findall(r'[\'"]final_answer[\'"]\s*:\s*([^,}]+)', response)
-        if matches:
-            answer = matches[-1].strip()
-            # Clean up trailing characters
-            answer = re.sub(r'[,}]*$', '', answer)
-            return answer
-        
-        # Fallback for "The final answer is: X" pattern with boxed
-        final_answer_pattern = r'[Tt]he final answer is:?\s*\$?\\boxed\{'
-        match = re.search(final_answer_pattern, response)
-        if match:
-            # Extract boxed content starting from this match
-            remaining_text = response[match.start():]
-            boxed_content = extract_boxed_content(remaining_text)
-            if boxed_content:
-                return boxed_content
-        
-        # More general pattern for "final answer is X"
-        matches = re.findall(r'[Tt]he final answer is:?\s*([^\n.]+)', response)
-        if matches:
-            answer = matches[-1].strip()
-            # Clean up common formatting
-            answer = re.sub(r'^\$?\\boxed\{([^}]+)\}\$?$', r'\1', answer)
-            answer = answer.replace('$', '').strip()
+        if isinstance(parsed, dict) and "final_answer" in parsed:
+            answer = _normalize_extracted_answer(parsed.get("final_answer", ""))
             if answer:
                 return answer
-        
-        return "No final answer found"
+
+    except (json.JSONDecodeError, KeyError, AttributeError):
+        pass
+
+    # 2) Try JSON recovery from fenced or braced snippets.
+    json_candidates: list[str] = []
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response, flags=re.DOTALL)
+    if fenced_match:
+        json_candidates.append(fenced_match.group(1))
+    first_brace = response.find("{")
+    last_brace = response.rfind("}")
+    if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
+        json_candidates.append(response[first_brace:last_brace + 1])
+    for candidate in json_candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and "final_answer" in parsed:
+                answer = _normalize_extracted_answer(parsed.get("final_answer", ""))
+                if answer:
+                    return answer
+        except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
+            continue
+
+    # 3) Regex fallbacks.
+    matches = re.findall(r"Finish\[(.*?)\]", response)
+    if matches:
+        answer = _normalize_extracted_answer(matches[-1])
+        if answer:
+            return answer
+
+    matches = re.findall(r'"final_answer"\s*:\s*"([^"]*)"', response)
+    if matches:
+        answer = _normalize_extracted_answer(matches[-1])
+        if answer:
+            return answer
+
+    matches = re.findall(r"'final_answer'\s*:\s*'([^']*)'", response)
+    if matches:
+        answer = _normalize_extracted_answer(matches[-1])
+        if answer:
+            return answer
+
+    # Handle simple unquoted values: "final_answer": some_value
+    matches = re.findall(r'[\'"]final_answer[\'"]\s*:\s*([^,}\n]+)', response)
+    if matches:
+        answer = _normalize_extracted_answer(matches[-1])
+        answer = re.sub(r'[,}]*$', '', answer).strip()
+        if answer:
+            return answer
+
+    final_answer_pattern = r'[Tt]he final answer is:?\s*\$?\\boxed\{'
+    match = re.search(final_answer_pattern, response)
+    if match:
+        remaining_text = response[match.start():]
+        boxed_content = extract_boxed_content(remaining_text)
+        if boxed_content:
+            answer = _normalize_extracted_answer(boxed_content)
+            if answer:
+                return answer
+
+    matches = re.findall(r'[Tt]he final answer is:?\s*([^\n.]+)', response)
+    if matches:
+        answer = _normalize_extracted_answer(matches[-1])
+        answer = re.sub(r'^\$?\\boxed\{([^}]+)\}\$?$', r'\1', answer)
+        answer = answer.replace('$', '').strip()
+        if answer:
+            return answer
+
+    return "No final answer found"
     
 enc = tiktoken.get_encoding("cl100k_base")
 def count_tokens(prompt: str) -> int:
@@ -166,7 +216,7 @@ def evaluate_single_test_sample(args_tuple, data_processor) -> Tuple[Dict, str]:
         question = task_dict["question"]
         target = task_dict["target"]
 
-        gen_response, bullet_ids, call_info = generator.generate(
+        gen_response, bullet_ids, call_info = generator.generate(  # BOOKMARK: test in ace eventually leads to here
             question=question,
             playbook=playbook,
             context=context,

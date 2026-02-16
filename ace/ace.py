@@ -37,30 +37,70 @@ class ACE:
         reflector_model: str,
         curator_model: str,
         max_tokens: int = 4096,
+        generator_max_tokens: Optional[int] = None,
+        reflector_max_tokens: Optional[int] = None,
+        curator_max_tokens: Optional[int] = None,
         initial_playbook: Optional[str] = None,
         use_bulletpoint_analyzer: bool = False,
-        bulletpoint_analyzer_threshold: float = 0.90
+        bulletpoint_analyzer_threshold: float = 0.90,
+        generator_base_url: Optional[str] = None,
+        generator_api_key: Optional[str] = None,
+        generator_api_provider: Optional[str] = None,
+        reflector_base_url: Optional[str] = None,
+        reflector_api_key: Optional[str] = None,
+        reflector_api_provider: Optional[str] = None,
+        curator_base_url: Optional[str] = None,
+        curator_api_key: Optional[str] = None,
+        curator_api_provider: Optional[str] = None,
     ):
         """
         Initialize the ACE system.
         
         Args:
-            api_provider: API provider for LLM calls
+            api_provider: Default API provider for LLM calls
             generator_model: Model name for generator
             reflector_model: Model name for reflector
             curator_model: Model name for curator
-            max_tokens: Maximum tokens for LLM calls
+            max_tokens: Default maximum tokens for LLM calls (used as fallback)
+            generator_max_tokens: Override max_tokens for generator (falls back to max_tokens)
+            reflector_max_tokens: Override max_tokens for reflector (falls back to max_tokens)
+            curator_max_tokens: Override max_tokens for curator (falls back to max_tokens)
             initial_playbook: Initial playbook content (optional)
             use_bulletpoint_analyzer: Whether to use bulletpoint analyzer for deduplication
             bulletpoint_analyzer_threshold: Similarity threshold for bulletpoint analyzer (0-1)
+            generator_base_url: Override base URL for generator client
+            generator_api_key: Override API key for generator client
+            generator_api_provider: Override api_provider for generator (affects max_tokens key)
+            reflector_base_url: Override base URL for reflector client
+            reflector_api_key: Override API key for reflector client
+            reflector_api_provider: Override api_provider for reflector
+            curator_base_url: Override base URL for curator client
+            curator_api_key: Override API key for curator client
+            curator_api_provider: Override api_provider for curator
         """
-        # Initialize API clients
-        generator_client, reflector_client, curator_client = initialize_clients(api_provider)
+        # Resolve per-role max_tokens (fall back to shared max_tokens)
+        gen_max_tokens = generator_max_tokens or max_tokens
+        ref_max_tokens = reflector_max_tokens or max_tokens
+        cur_max_tokens = curator_max_tokens or max_tokens
 
-        # Initialize the three agents
-        self.generator = Generator(generator_client, api_provider, generator_model, max_tokens)
-        self.reflector = Reflector(reflector_client, api_provider, reflector_model, max_tokens)
-        self.curator = Curator(curator_client, api_provider, curator_model, max_tokens)
+        # Initialize API clients
+        generator_client, reflector_client, curator_client = initialize_clients(
+            api_provider,
+            generator_base_url=generator_base_url,
+            generator_api_key=generator_api_key,
+            reflector_base_url=reflector_base_url,
+            reflector_api_key=reflector_api_key,
+            curator_base_url=curator_base_url,
+            curator_api_key=curator_api_key,
+        )
+
+        # Initialize the three agents (per-actor api_provider for max_tokens key selection)
+        gen_provider = generator_api_provider or api_provider
+        ref_provider = reflector_api_provider or api_provider
+        cur_provider = curator_api_provider or api_provider
+        self.generator = Generator(generator_client, gen_provider, generator_model, gen_max_tokens)
+        self.reflector = Reflector(reflector_client, ref_provider, reflector_model, ref_max_tokens)
+        self.curator = Curator(curator_client, cur_provider, curator_model, cur_max_tokens)
         
         # Initialize bulletpoint analyzer if requested and available
         self.use_bulletpoint_analyzer = use_bulletpoint_analyzer
@@ -70,7 +110,7 @@ class ACE:
             self.bulletpoint_analyzer = BulletpointAnalyzer(
                 curator_client, 
                 curator_model, 
-                max_tokens
+                cur_max_tokens
             )
             print(f"✓ BulletpointAnalyzer initialized (threshold={bulletpoint_analyzer_threshold})")
         else:
@@ -369,7 +409,7 @@ class ACE:
         
         return results
     
-    def _run_test(
+    def _run_test(  # BOOKMARK: main eval function for ace
         self,
         test_samples: List[Dict[str, Any]],
         data_processor,
