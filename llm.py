@@ -13,7 +13,8 @@ import openai
 from logger import log_llm_call, log_problematic_request
 
 def timed_llm_call(client, api_provider, model, prompt, role, call_id, max_tokens=4096, log_dir=None,
-                   sleep_seconds=15, retries_on_timeout=1000, attempt=1, use_json_mode=False):
+                   sleep_seconds=15, retries_on_timeout=1000, attempt=1, use_json_mode=False,
+                   system_prompt=None):
     """
     Make a timed LLM call with error handling and retry logic.
     
@@ -37,6 +38,7 @@ def timed_llm_call(client, api_provider, model, prompt, role, call_id, max_token
         retries_on_timeout: Maximum number of retries for timeouts/rate limits/empty responses
         attempt: Current attempt number (for recursive calls)
         use_json_mode: Whether to use JSON mode for structured output
+        system_prompt: Optional system message prepended to the messages list
     
     Returns:
         tuple: (response_text, call_info_dict)
@@ -64,9 +66,13 @@ def timed_llm_call(client, api_provider, model, prompt, role, call_id, max_token
             else:
                 max_tokens_key = "max_tokens"
 
+            messages = [{"role": "user", "content": prompt}]
+            if system_prompt:
+                messages.insert(0, {"role": "system", "content": system_prompt})
+
             api_params = {
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": messages,
                 "temperature": 0.0,
                 max_tokens_key: max_tokens
             }
