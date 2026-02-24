@@ -73,9 +73,12 @@ def timed_llm_call(client, api_provider, model, prompt, role, call_id, max_token
             api_params = {
                 "model": model,
                 "messages": messages,
-                "temperature": 0.0,
                 max_tokens_key: max_tokens
             }
+
+            NO_TEMPERATURE_MODELS = {"gpt-5-mini"}
+            if model not in NO_TEMPERATURE_MODELS:
+                api_params["temperature"] = 0.0
             
             # Add JSON mode if requested
             if use_json_mode:

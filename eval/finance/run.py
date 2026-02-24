@@ -2,16 +2,64 @@
 """
 Example usage script for the ACE system.
 
+Modified for DiaKV
+Examples:
+export PYTHONPATH=/home/yejoon/kv/ace:$PYTHONPATH
+python -m eval.finance.run \
+    --task_name finer \
+    --mode offline \
+    --save_path results \
+    --api_provider openai \
+    --generator_model Qwen/Qwen3-4B-Instruct-2507 \
+    --generator_base_url http://localhost:8000/v1 \
+    --generator_api_key EMPTY \
+    --generator_api_provider vllm \
+    --generator_max_tokens 4096 \
+    --reflector_model gpt-5.2-2025-12-11 \
+    --reflector_max_tokens 16384 \
+    --curator_model gpt-5.2-2025-12-11 \
+    --curator_max_tokens 16384 \
+    --max_num_rounds 2 \
+    --save_steps N \
+    --eval_steps N
+
+python -m eval.finance.run \
+    --task_name finer \
+    --mode offline \
+    --save_path results \
+    --api_provider openai \
+    --generator_model gpt-5-mini \
+    --reflector_model gpt-5.2 \
+    --curator_model gpt-5.2 \
+    --generator_max_tokens 16384 \
+    --reflector_max_tokens 16384 \
+    --curator_max_tokens 16384
+
+Without --initial_playbook_path, --use_bulletpoint_analyzer, and --bulletpoint_analyzer_threshold, configs to ACE is idential to baseline/ace/run.py
 """
 import os
 import json
 import openai
 import argparse
 from datetime import datetime
+from typing import Any, Callable, Dict, List, Tuple
 from .data_processor import DataProcessor
 
 from ace import ACE
+from llm import timed_llm_call
 from utils import initialize_clients
+
+
+SIMPLE_EVAL_SYSTEM_PROMPT: str = "Answer the question with a concise and accurate answer. Only return the answer, no other text."
+
+SIMPLE_EVAL_PROMPT: str = (
+    "{context}"
+    " Answer the question with a concise and accurate answer. Only return the answer, no other text."
+    "\n\nPlaybook:\n{playbook}"
+    "\n\n- Read the playbook carefully and apply relevant strategies, formulas, and insights"
+    "\n- Pay attention to common mistakes listed in the playbook and avoid them"
+    "\n\nQuestion: {question}"
+)
 
 def parse_args():
     """Parse command line arguments."""
@@ -41,10 +89,21 @@ def parse_args():
                         default="DeepSeek-V3.1",
                         help="Model for curator")
     
+    # Per-role overrides (base_url, api_key, api_provider, max_tokens)
+    for role in ("generator", "reflector", "curator"):
+        parser.add_argument(f"--{role}_base_url", type=str, default=None,
+                            help=f"Override base URL for {role} client")
+        parser.add_argument(f"--{role}_api_key", type=str, default=None,
+                            help=f"Override API key for {role} client")
+        parser.add_argument(f"--{role}_api_provider", type=str, default=None,
+                            help=f"Override api_provider for {role}")
+        parser.add_argument(f"--{role}_max_tokens", type=int, default=None,
+                            help=f"Override max_tokens for {role}")
+    
     # Training configuration
     parser.add_argument("--num_epochs", type=int, default=1,
                         help="Number of training epochs")
-    parser.add_argument("--max_num_rounds", type=int, default=3,
+    parser.add_argument("--max_num_rounds", type=int, default=2,
                         help="Max reflection rounds for incorrect answers")
     parser.add_argument("--curator_frequency", type=int, default=1,
                         help="Run curator every N steps")
@@ -60,7 +119,7 @@ def parse_args():
                         help="Max tokens for LLM responses")
     parser.add_argument("--playbook_token_budget", type=int, default=80000,
                         help="Total token budget for playbook")
-    parser.add_argument("--test_workers", type=int, default=20,
+    parser.add_argument("--test_workers", type=int, default=50,
                         help="Number of parallel workers for testing")
     
     # Prompt configuration
@@ -164,6 +223,118 @@ def load_initial_playbook(path):
     return None
 
 
+def simple_eval_playbook(
+    ace_system: ACE,
+    playbook: str,
+    test_samples: List[Dict[str, Any]],
+    data_processor: "DataProcessor",
+    save_dir: str,
+    prefix: str = "test",
+) -> Dict[str, Any]:
+    """Evaluate playbook on test samples using a simplified prompt.
+
+    Uses a stripped-down prompt instead of ACE's internal eval, which
+    reuses the complex reflection/curation prompts that burden weaker LMs.
+
+    Args:
+        ace_system: ACE instance (used for its generator client).
+        playbook: Playbook text to evaluate.
+        test_samples: List of dicts with 'context', 'question', 'target'.
+        data_processor: DataProcessor with evaluate_accuracy().
+        save_dir: Directory to save results JSON.
+        prefix: Filename prefix (e.g. 'initial', 'final').
+
+    Returns:
+        Results dict with 'accuracy', 'correct', 'total'.
+    """
+    gen = ace_system.generator
+    predictions: List[str] = []
+    targets: List[str] = []
+
+    for idx, sample in enumerate(test_samples):
+        prompt = SIMPLE_EVAL_PROMPT.format(
+            context=sample["context"],
+            playbook=playbook,
+            question=sample["question"],
+        )
+        response, _ = timed_llm_call(
+            gen.api_client,
+            gen.api_provider,
+            gen.model,
+            prompt,
+            role="simple_eval",
+            call_id=f"{prefix}_{idx}",
+            max_tokens=gen.max_tokens,
+            system_prompt=SIMPLE_EVAL_SYSTEM_PROMPT,
+        )
+        predictions.append(response.strip())
+        targets.append(sample["target"])
+
+    accuracy = data_processor.evaluate_accuracy(predictions, targets)
+    correct = int(round(accuracy * len(test_samples)))
+    results: Dict[str, Any] = {
+        "accuracy": accuracy,
+        "correct": correct,
+        "total": len(test_samples),
+        "no_answer": 0,
+    }
+
+    os.makedirs(save_dir, exist_ok=True)
+    results_path = os.path.join(save_dir, f"{prefix}_test_results.json")
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"  {prefix.upper()} Test Accuracy: {accuracy:.3f}")
+    return results
+
+
+def simple_eval_validation_fn(
+    data_processor: "DataProcessor",
+) -> Callable[..., Tuple[Dict, Dict]]:
+    """Return a validation callback that uses the simplified eval prompt.
+
+    Callback signature matches ACE's validation_eval_fn:
+        (ace_system, playbook, val_samples, save_path, log_dir, epoch, step) -> (val_results, error_log)
+    """
+    def validation_callback(ace_system, playbook, val_samples, save_path, log_dir, epoch, step):
+        gen = ace_system.generator
+        predictions: List[str] = []
+        targets: List[str] = []
+
+        for idx, sample in enumerate(val_samples):
+            prompt = SIMPLE_EVAL_PROMPT.format(
+                context=sample["context"],
+                playbook=playbook,
+                question=sample["question"],
+            )
+            response, _ = timed_llm_call(
+                gen.api_client,
+                gen.api_provider,
+                gen.model,
+                prompt,
+                role="simple_eval",
+                call_id=f"val_e{epoch}_s{step}_{idx}",
+                max_tokens=gen.max_tokens,
+                system_prompt=SIMPLE_EVAL_SYSTEM_PROMPT,
+            )
+            predictions.append(response.strip())
+            targets.append(sample["target"])
+
+        accuracy = data_processor.evaluate_accuracy(predictions, targets)
+        correct = int(round(accuracy * len(val_samples)))
+        val_results: Dict[str, Any] = {
+            "accuracy": accuracy,
+            "correct": correct,
+            "total": len(val_samples),
+            "no_answer": 0,
+        }
+        error_log: Dict[str, Any] = {"accuracy": accuracy, "errors": []}
+        print(f"  Val (simple_eval): acc={accuracy:.3f}")
+        return val_results, error_log
+
+    return validation_callback
+
+
 def main():
     """Main execution function."""
     args = parse_args()
@@ -200,9 +371,21 @@ def main():
         reflector_model=args.reflector_model,
         curator_model=args.curator_model,
         max_tokens=args.max_tokens,
+        generator_max_tokens=args.generator_max_tokens,
+        reflector_max_tokens=args.reflector_max_tokens,
+        curator_max_tokens=args.curator_max_tokens,
         initial_playbook=initial_playbook,
         use_bulletpoint_analyzer=args.use_bulletpoint_analyzer,
-        bulletpoint_analyzer_threshold=args.bulletpoint_analyzer_threshold
+        bulletpoint_analyzer_threshold=args.bulletpoint_analyzer_threshold,
+        generator_base_url=args.generator_base_url,
+        generator_api_key=args.generator_api_key,
+        generator_api_provider=args.generator_api_provider,
+        reflector_base_url=args.reflector_base_url,
+        reflector_api_key=args.reflector_api_key,
+        reflector_api_provider=args.reflector_api_provider,
+        curator_base_url=args.curator_base_url,
+        curator_api_key=args.curator_api_key,
+        curator_api_provider=args.curator_api_provider,
     )
     
     # Prepare configuration
@@ -226,16 +409,53 @@ def main():
         'api_provider': args.api_provider
     }
     
-    # Execute using the unified run method
-    results = ace_system.run(
-        mode=args.mode,
-        train_samples=train_samples,
-        val_samples=val_samples,
-        test_samples=test_samples,
-        data_processor=data_processor,
-        config=config
-    )
-        
+    # --- Simple eval for initial / final test, bypassing ACE's internal eval ---
+    os.makedirs(args.save_path, exist_ok=True)
+
+    if args.mode == "eval_only":
+        # No training; just evaluate with the loaded playbook.
+        playbook = initial_playbook or ""
+        print(f"\n{'='*60}")
+        print(f"EVAL ONLY (simple_eval)")
+        print(f"{'='*60}\n")
+        simple_eval_playbook(
+            ace_system, playbook, test_samples, data_processor,
+            save_dir=args.save_path, prefix="eval_only",
+        )
+    else:
+        # Initial eval (before training) with empty / initial playbook
+        if test_samples:
+            print(f"\n{'='*60}")
+            print(f"INITIAL TEST (simple_eval, before training)")
+            print(f"{'='*60}\n")
+            simple_eval_playbook(
+                ace_system, ace_system.playbook, test_samples, data_processor,
+                save_dir=args.save_path, prefix="initial",
+            )
+
+        # Run ACE training.
+        # test_samples=None so ACE skips its internal initial/final eval;
+        # validation_eval_fn overrides the default ACE validation prompt.
+        ace_system.run(
+            mode=args.mode,
+            train_samples=train_samples,
+            val_samples=val_samples,
+            test_samples=None,
+            data_processor=data_processor,
+            config=config,
+            validation_eval_fn=simple_eval_validation_fn(data_processor),
+        )
+
+        # Final eval (after training) with best playbook
+        if test_samples:
+            print(f"\n{'='*60}")
+            print(f"FINAL TEST (simple_eval, with best playbook)")
+            print(f"{'='*60}\n")
+            simple_eval_playbook(
+                ace_system, ace_system.best_playbook, test_samples, data_processor,
+                save_dir=args.save_path, prefix="final",
+            )
+
 
 if __name__ == "__main__":
     main()

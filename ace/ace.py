@@ -11,7 +11,7 @@ This module coordinates three agents:
 import os
 import json
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Callable, Dict, List, Tuple, Optional, Any
 
 from .core import Generator, Reflector, Curator, BulletpointAnalyzer
 from playbook_utils import *
@@ -210,7 +210,8 @@ class ACE:
         val_samples: Optional[List[Dict[str, Any]]] = None,
         test_samples: Optional[List[Dict[str, Any]]] = None,
         data_processor = None,
-        config: Dict[str, Any] = None
+        config: Dict[str, Any] = None,
+        validation_eval_fn: Optional[Callable[..., Tuple[Dict, Dict]]] = None,
     ) -> Dict[str, Any]:
         """
         Main entrypoint for running ACE system in different modes.
@@ -314,7 +315,8 @@ class ACE:
                 save_path=save_path,
                 usage_log_path=usage_log_path,
                 playbook_dir=playbook_dir,
-                log_dir=log_dir
+                log_dir=log_dir,
+                validation_eval_fn=validation_eval_fn,
             )
             results['training_results'] = training_results
             
@@ -678,7 +680,8 @@ class ACE:
         save_path: str,
         usage_log_path: str,
         playbook_dir: str,
-        log_dir: str
+        log_dir: str,
+        validation_eval_fn: Optional[Callable[..., Tuple[Dict, Dict]]] = None,
     ) -> Dict[str, Any]:
         """
         Run offline training
@@ -788,12 +791,20 @@ class ACE:
                     
                     # Validation evaluation
                     val_results = {}
+                    val_error_log = {}
                     if val_samples:
-                        val_results, val_error_log = evaluate_test_set(
-                            data_processor, self.generator, self.playbook, 
-                            val_samples, self.max_tokens, log_dir, 
-                            max_workers=test_workers, use_json_mode=use_json_mode
-                        )
+                        if validation_eval_fn is not None:
+                            val_results, val_error_log = validation_eval_fn(
+                                self, self.playbook, val_samples,
+                                save_path, log_dir, epoch, step
+                            )
+                        else:
+                            print("Validation evaluation function is not provided. Fallback to default ace evaluation.")
+                            val_results, val_error_log = evaluate_test_set(
+                                data_processor, self.generator, self.playbook,
+                                val_samples, self.max_tokens, log_dir,
+                                max_workers=test_workers, use_json_mode=use_json_mode
+                            )
                     
                     result = {
                         "epoch": epoch,
